@@ -2,7 +2,7 @@
 
 An application that extracts and displays EXIF metadata from image files. It focuses on **when and where** photos were taken and **device identifiers**, and ignores exposure settings and technical image metadata.
 
-This application will identifed image files within folders and automatically extract relevant exif/metadata info for use in determinng location, time/date, and device information.
+This application will identify image files within folders and automatically extract relevant exif/metadata info for use in determinng location, time/date, and device information.
 
 ## Features
 
