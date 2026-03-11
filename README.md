@@ -2,9 +2,8 @@
 
 A desktop application for extracting, viewing, and exporting EXIF and metadata from digital image and video files. Built with Python and PyQt5, it is designed for investigative, forensic, and analytical workflows where understanding the origin, timing, and location context of media files is essential.
 
-![Python](https://img.shields.io/badge/Python-3.8%2B-blue)
-![License](https://img.shields.io/badge/License-MIT-green)
 ![Platform](https://img.shields.io/badge/Platform-Windows-lightgrey)
+![Python](https://img.shields.io/badge/Python-3.8%2B-blue)
 
 ---
 
