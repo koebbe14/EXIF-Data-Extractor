@@ -1,20 +1,34 @@
 """
-EXIF data extraction module for image files.
-Extracts only date/time, GPS coordinates, and device identifiers.
-Excludes exposure settings and image metadata.
+Metadata extraction module for image and video files.
+Extracts date/time, GPS coordinates, and device identifiers.
+Uses exifread/PIL for images and pymediainfo for videos.
 """
 
 import exifread
+import re
 from PIL import Image
 from PIL.ExifTags import TAGS
 from datetime import datetime
 from typing import List, Optional, Tuple
 from data_model import ExifData
+from file_scanner import is_video_file
 import os
 import warnings
 from pathlib import Path
 from contextlib import redirect_stderr
 from io import StringIO
+
+try:
+    from pymediainfo import MediaInfo
+    PYMEDIAINFO_AVAILABLE = True
+except ImportError:
+    PYMEDIAINFO_AVAILABLE = False
+
+try:
+    from pillow_heif import register_heif_opener
+    register_heif_opener()
+except ImportError:
+    pass
 
 # Increase PIL image size limit to handle large images (we only read EXIF, not the full image)
 Image.MAX_IMAGE_PIXELS = None  # Disable decompression bomb check
@@ -86,6 +100,169 @@ def _parse_datetime(date_str: str) -> Optional[datetime]:
     return None
 
 
+def _parse_iso6709(location_str: str) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    """
+    Parse an ISO 6709 location string into (latitude, longitude, altitude).
+    Handles formats like "+34.0522-118.2437+100.000/" and "+34.0522-118.2437/".
+    Also handles the compact DMS forms: +DDMM.MM-DDDMM.MM and +DDMMSS.SS-DDDMMSS.SS.
+    """
+    if not location_str or not isinstance(location_str, str):
+        return None, None, None
+
+    location_str = location_str.strip().rstrip('/')
+
+    # Decimal degrees: +/-lat+/-lon optionally followed by +/-alt
+    m = re.match(
+        r'([+-]\d+(?:\.\d+)?)'   # latitude
+        r'([+-]\d+(?:\.\d+)?)'   # longitude
+        r'(?:([+-]\d+(?:\.\d+)?))?',  # optional altitude
+        location_str
+    )
+    if not m:
+        return None, None, None
+
+    try:
+        lat = float(m.group(1))
+        lon = float(m.group(2))
+        alt = float(m.group(3)) if m.group(3) else None
+    except (ValueError, TypeError):
+        return None, None, None
+
+    if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+        return None, None, None
+
+    return lat, lon, alt
+
+
+def _extract_video_metadata(file_path: str) -> ExifData:
+    """
+    Extract metadata from a video file using pymediainfo.
+    Extracts date/time, GPS coordinates, and device identifiers.
+    """
+    file_name = os.path.basename(file_path)
+    exif_data = ExifData(file_path=file_path, file_name=file_name)
+
+    if not PYMEDIAINFO_AVAILABLE:
+        return exif_data
+
+    try:
+        media_info = MediaInfo.parse(file_path)
+    except Exception:
+        return exif_data
+
+    general_data = {}
+    for track in media_info.tracks:
+        if track.track_type == "General":
+            general_data = track.to_data()
+            break
+
+    # --- Date/time ---
+    for date_key in ('recorded_date', 'encoded_date', 'tagged_date',
+                     'mastered_date', 'file_last_modification_date'):
+        raw = general_data.get(date_key)
+        if raw:
+            date_str = str(raw)
+            # MediaInfo often prefixes dates with "UTC " -- strip it for parsing
+            if date_str.upper().startswith('UTC '):
+                date_str = date_str[4:]
+            parsed = _parse_datetime(date_str)
+            if parsed:
+                exif_data.date_taken = parsed
+                break
+
+    # --- GPS from ISO 6709 location fields ---
+    location_raw = None
+    for loc_key in ('xyz', 'comapplequicktimelocationiso6709',
+                    'com_apple_quicktime_location_iso6709',
+                    'location'):
+        val = general_data.get(loc_key)
+        if val:
+            location_raw = str(val)
+            break
+
+    # Fallback: scan all keys for anything containing "location" or "gps"
+    if not location_raw:
+        for key, val in general_data.items():
+            if val and any(kw in key.lower() for kw in ('location', 'gps', 'xyz', 'iso6709')):
+                candidate = str(val)
+                if re.search(r'[+-]\d', candidate):
+                    location_raw = candidate
+                    break
+
+    if location_raw:
+        lat, lon, alt = _parse_iso6709(location_raw)
+        if lat is not None:
+            exif_data.latitude = lat
+        if lon is not None:
+            exif_data.longitude = lon
+        if alt is not None:
+            exif_data.altitude = alt
+
+    # --- Make / Model ---
+    for make_key in ('comapplequicktimemake', 'com_apple_quicktime_make',
+                     'make', 'performer'):
+        val = general_data.get(make_key)
+        if val:
+            exif_data.make = str(val).strip()
+            break
+
+    for model_key in ('comapplequicktimemodel', 'com_apple_quicktime_model',
+                      'model', 'camera_model_name'):
+        val = general_data.get(model_key)
+        if val:
+            exif_data.model = str(val).strip()
+            break
+
+    # --- Serial number ---
+    for serial_key in ('comapplequicktimecreationdate', 'serial_number',
+                       'comapplequicktimeserialnumber'):
+        val = general_data.get(serial_key)
+        if val and serial_key != 'comapplequicktimecreationdate':
+            exif_data.serial_number = str(val).strip()
+            break
+
+    # --- Software / writing application ---
+    for sw_key in ('writing_application', 'encoding_settings',
+                   'comapplequicktimesoftware', 'com_apple_quicktime_software',
+                   'encoded_library_name'):
+        val = general_data.get(sw_key)
+        if val:
+            exif_data.software = str(val).strip()
+            break
+
+    return exif_data
+
+
+def _get_all_video_tags(file_path: str) -> List[Tuple[str, str]]:
+    """
+    Read all metadata tags from a video file using pymediainfo.
+    Returns a sorted list of (tag_name, value_str).
+    """
+    if not PYMEDIAINFO_AVAILABLE:
+        return []
+
+    try:
+        media_info = MediaInfo.parse(file_path)
+    except Exception:
+        return []
+
+    result: List[Tuple[str, str]] = []
+    for track in media_info.tracks:
+        track_type = track.track_type or "Unknown"
+        data = track.to_data()
+        for key, value in sorted(data.items()):
+            if value is None or str(value).strip() == '':
+                continue
+            tag_name = f"[{track_type}] {key}"
+            val_str = str(value).strip()
+            # Truncate very long values to keep the dialog readable
+            if len(val_str) > 500:
+                val_str = val_str[:500] + "..."
+            result.append((tag_name, val_str))
+
+    return sorted(result, key=lambda x: x[0])
+
+
 # Tag keys that contain binary data; show a short summary instead of raw bytes
 _BINARY_TAGS = frozenset({
     'JPEGThumbnail', 'TIFFThumbnail', 'EXIF MakerNote', 'EXIF Makernote',
@@ -95,10 +272,14 @@ _BINARY_TAGS = frozenset({
 
 def get_all_exif_tags(file_path: str) -> List[Tuple[str, str]]:
     """
-    Read all EXIF/metadata tags from an image file for display.
+    Read all EXIF/metadata tags from a media file for display.
+    Routes to pymediainfo for video files and exifread/PIL for images.
     Returns a sorted list of (tag_name, value_str). Binary tags are summarized as "(binary, N bytes)".
     On error returns an empty list.
     """
+    if is_video_file(file_path):
+        return _get_all_video_tags(file_path)
+
     result: List[Tuple[str, str]] = []
     seen: set = set()
 
@@ -151,9 +332,12 @@ def get_all_exif_tags(file_path: str) -> List[Tuple[str, str]]:
 
 def extract_exif_data(file_path: str) -> ExifData:
     """
-    Extract EXIF data from an image file.
+    Extract metadata from a media file (image or video).
     Only extracts date/time, GPS coordinates, and device identifiers.
     """
+    if is_video_file(file_path):
+        return _extract_video_metadata(file_path)
+
     file_name = os.path.basename(file_path)
     exif_data = ExifData(file_path=file_path, file_name=file_name)
 
