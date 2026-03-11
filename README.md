@@ -20,13 +20,6 @@ A desktop application for extracting, viewing, and exporting EXIF and metadata f
 - **Dark Mode** — Toggle between light and dark themes from the File menu; preference is saved between sessions
 - **Standalone Executable** — Can be packaged as a single `.exe` with PyInstaller
 
----
-
-## Screenshots
-
-<!-- Add screenshots of your application here -->
-<!-- ![Main Window](screenshots/main_window.png) -->
-<!-- ![Dark Mode](screenshots/dark_mode.png) -->
 
 ---
 
