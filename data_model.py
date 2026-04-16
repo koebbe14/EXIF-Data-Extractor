@@ -4,6 +4,7 @@ Only includes date/time, GPS coordinates, and device identifiers.
 """
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional, Any
 from datetime import datetime
 
@@ -23,10 +24,29 @@ class ExifData:
     serial_number: Optional[str] = None
     software: Optional[str] = None
     thumbnail: Optional[Any] = None  # PIL Image object for thumbnail
+    # Lazy cache used for "include full metadata" search. Filled on demand.
+    full_metadata_search_text: Optional[str] = None
 
     def has_gps(self) -> bool:
         """Check if GPS coordinates are available."""
         return self.latitude is not None and self.longitude is not None
+
+    @property
+    def extension(self) -> str:
+        try:
+            return Path(self.file_name or self.file_path).suffix.lower()
+        except Exception:
+            return ""
+
+    @property
+    def is_video(self) -> bool:
+        ext = self.extension
+        return ext in {
+            '.mp4', '.m4v', '.mov', '.avi', '.mkv',
+            '.wmv', '.asf', '.flv', '.webm',
+            '.3gp', '.3g2', '.mts', '.m2ts', '.ts',
+            '.vob', '.mpg', '.mpeg', '.ogv',
+        }
     
     def to_dict(self) -> dict:
         """Convert to dictionary for export."""

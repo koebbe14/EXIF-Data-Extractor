@@ -4,6 +4,7 @@ Main application window for EXIF Data Extractor GUI.
 
 import sys
 import os
+from datetime import datetime
 
 # Suppress Qt ICC profile warnings when loading thumbnails (unsupported profile class)
 os.environ["QT_LOGGING_RULES"] = "qt.gui.icc=false"
@@ -12,9 +13,10 @@ import io
 from pathlib import Path
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QTableWidget, QTableWidgetItem, QFileDialog,
+    QPushButton, QFileDialog,
     QProgressBar, QStatusBar, QMessageBox, QHeaderView, QLabel,
     QMenu, QAction, QDialog, QTextEdit, QTextBrowser, QDialogButtonBox,
+    QTableView,
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSettings
 from PyQt5.QtGui import QIcon, QPixmap, QImage, QPalette, QColor
@@ -25,6 +27,11 @@ from data_model import ExifData
 from export_utils import export_to_csv, export_to_json, export_to_pdf, export_to_kmz
 from map_utils import open_location_in_map
 from thumbnail_utils import create_thumbnail
+from exif_table_model import ExifTableModel
+from exif_filter_proxy import ExifFilterProxy, ExifProxyFilters
+from import_mode_dialog import choose_import_mode
+from search_dialog import SearchDialog, SearchSettings
+from filter_dialog import FilterDialog, FilterSettings
 
 
 class ExtractionWorker(QThread):
@@ -147,7 +154,7 @@ QPushButton:disabled {
     color: #6e6e6e;
     border-color: #3c3c3c;
 }
-QTableWidget {
+QTableWidget, QTableView {
     background-color: #1e1e1e;
     alternate-background-color: #262626;
     color: #d4d4d4;
@@ -156,7 +163,7 @@ QTableWidget {
     selection-background-color: #094771;
     selection-color: #ffffff;
 }
-QTableWidget::item {
+QTableWidget::item, QTableView::item {
     padding: 4px;
 }
 QHeaderView::section {
@@ -235,6 +242,78 @@ QFileDialog {
     background-color: #1e1e1e;
     color: #d4d4d4;
 }
+QGroupBox {
+    background-color: #252526;
+    border: 1px solid #3c3c3c;
+    border-radius: 4px;
+    margin-top: 8px;
+    padding: 10px 8px 8px 8px;
+    font-weight: bold;
+    color: #d4d4d4;
+}
+QGroupBox::title {
+    subcontrol-origin: margin;
+    left: 10px;
+    padding: 0 4px;
+    color: #d4d4d4;
+}
+QLineEdit {
+    background-color: #2d2d2d;
+    color: #d4d4d4;
+    border: 1px solid #3c3c3c;
+    border-radius: 2px;
+    padding: 4px 6px;
+}
+QLineEdit:focus {
+    border-color: #0e639c;
+}
+QComboBox {
+    background-color: #2d2d2d;
+    color: #d4d4d4;
+    border: 1px solid #3c3c3c;
+    border-radius: 2px;
+    padding: 3px 6px;
+}
+QComboBox::drop-down {
+    border: none;
+}
+QComboBox QAbstractItemView {
+    background-color: #2d2d2d;
+    color: #d4d4d4;
+    selection-background-color: #094771;
+    selection-color: #ffffff;
+}
+QDateEdit {
+    background-color: #2d2d2d;
+    color: #d4d4d4;
+    border: 1px solid #3c3c3c;
+    border-radius: 2px;
+    padding: 3px 6px;
+}
+QCheckBox {
+    color: #d4d4d4;
+    spacing: 6px;
+}
+QCheckBox::indicator {
+    width: 14px;
+    height: 14px;
+}
+QListWidget {
+    background-color: #1e1e1e;
+    color: #d4d4d4;
+    border: 1px solid #3c3c3c;
+    border-radius: 2px;
+}
+QListWidget::item {
+    padding: 2px 4px;
+}
+QListWidget::item:hover {
+    background-color: #2a2d2e;
+}
+QRadioButton {
+    color: #d4d4d4;
+    spacing: 6px;
+}
 """
 
 
@@ -278,8 +357,25 @@ class MainWindow(QMainWindow):
         self.drop_hint.setStyleSheet("color: #888; font-style: italic; font-size: 8pt;")
         controls_layout.addWidget(self.drop_hint)
         controls_layout.addStretch()
+
+        self.search_button = QPushButton("Search")
+        self.search_button.clicked.connect(self.open_search_dialog)
+        controls_layout.addWidget(self.search_button)
+
+        self.filter_button = QPushButton("Filter")
+        self.filter_button.clicked.connect(self.open_filter_dialog)
+        controls_layout.addWidget(self.filter_button)
+
+        self.clear_search_filter_button = QPushButton("Clear Search/Filters")
+        self.clear_search_filter_button.setEnabled(False)
+        self.clear_search_filter_button.clicked.connect(self.clear_search_and_filters)
+        controls_layout.addWidget(self.clear_search_filter_button)
         
         layout.addLayout(controls_layout)
+        # Result count (small, unobtrusive)
+        self.result_count_label = QLabel("")
+        self.result_count_label.setStyleSheet("color: #888; font-size: 8pt;")
+        layout.addWidget(self.result_count_label)
         
         # Progress bar
         self.progress_bar = QProgressBar()
@@ -287,30 +383,35 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.progress_bar)
         
         # Results table
-        self.table = QTableWidget()
-        self.table.setColumnCount(10)  # Added thumbnail column
-        self.table.setHorizontalHeaderLabels([
-            "Thumbnail", "File Name", "Timestamp", "Latitude", "Longitude", "Altitude",
-            "Make", "Model", "Serial Number", "Software"
-        ])
-        self.table.horizontalHeader().setStretchLastSection(True)
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)  # Allow manual column resizing
-        # Set initial column widths (ensure headers are not truncated)
-        self.table.setColumnWidth(0, 192)  # Thumbnail
-        self.table.setColumnWidth(1, 240)  # File Name
-        self.table.setColumnWidth(2, 138)  # Timestamp
-        self.table.setColumnWidth(3, 138)  # Latitude
-        self.table.setColumnWidth(4, 153)  # Longitude
-        self.table.setColumnWidth(5, 92)   # Altitude
-        self.table.setColumnWidth(6, 110)  # Make
-        self.table.setColumnWidth(7, 180)  # Model
-        self.table.setColumnWidth(8, 168)  # Serial Number
-        self.table.setColumnWidth(9, 138)  # Software
-        # Set row height for thumbnails
-        self.table.verticalHeader().setDefaultSectionSize(192)
-        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table = QTableView()
+        self.table.setAlternatingRowColors(True)
+        self.table.setSelectionBehavior(QTableView.SelectRows)
+        self.table.setSelectionMode(QTableView.ExtendedSelection)
+        self.table.setSortingEnabled(True)
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self.show_context_menu)
+
+        self.source_model = ExifTableModel([])
+        self.proxy_model = ExifFilterProxy(self)
+        self.proxy_model.setSourceModel(self.source_model)
+        self.table.setModel(self.proxy_model)
+
+        self._filters = ExifProxyFilters()
+
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        self.table.setColumnWidth(0, 192)
+        self.table.setColumnWidth(1, 240)
+        self.table.setColumnWidth(2, 138)
+        self.table.setColumnWidth(3, 138)
+        self.table.setColumnWidth(4, 153)
+        self.table.setColumnWidth(5, 92)
+        self.table.setColumnWidth(6, 110)
+        self.table.setColumnWidth(7, 180)
+        self.table.setColumnWidth(8, 168)
+        self.table.setColumnWidth(9, 138)
+        self.table.verticalHeader().setDefaultSectionSize(192)
+
         layout.addWidget(self.table)
         
         # Bottom buttons
@@ -534,6 +635,63 @@ Not all devices record this.</td></tr>
 (e.g. iOS version, Android version, Adobe Lightroom).</td></tr>
 </table>
 
+<h3>Search</h3>
+<p>Click the <b>Search</b> button in the toolbar to open the Search dialog. \
+You can search across filenames, file paths, device make/model, serial \
+numbers, software, GPS coordinates, timestamps, and any other extracted \
+metadata.</p>
+<ul>
+  <li><b>Partial match</b> (default) &ndash; Case-insensitive substring \
+search. Typing <code>iphone</code> matches &ldquo;iPhone 13 Pro Max&rdquo;.</li>
+  <li><b>Exact match</b> &ndash; Uncheck &ldquo;Partial match&rdquo; to \
+require that every keyword you type appears as a complete token in the \
+row&rsquo;s metadata.</li>
+  <li><b>GPS search</b> &ndash; Enter a single number like \
+<code>34.0522</code> to match any latitude or longitude, or a pair like \
+<code>34.0522,-118.2437</code> to match both.</li>
+  <li><b>Include full metadata</b> &ndash; When checked, the search also \
+looks through every EXIF/MediaInfo tag (not just the columns shown in the \
+table). This is more thorough but slower on large collections.</li>
+</ul>
+<p>Click <b>Clear</b> in the Search dialog or <b>Clear Search/Filters</b> \
+in the toolbar to reset the search and show all results again.</p>
+
+<h3>Filter</h3>
+<p>Click the <b>Filter</b> button to open the Filter dialog. Filters \
+let you narrow results by specific criteria. All active filters are \
+combined (AND logic), so each additional filter further restricts the \
+visible results.</p>
+<ul>
+  <li><b>File type</b> &ndash; Show All files, Images only, or Videos only.</li>
+  <li><b>GPS</b> &ndash; Show all files, only files that have GPS \
+coordinates, or only files missing GPS.</li>
+  <li><b>Serial number</b> &ndash; Show all files, only files with a serial \
+number present, or only files missing a serial number.</li>
+  <li><b>Date range</b> &ndash; Enable a From and/or To date to restrict \
+results to files whose embedded timestamp falls within that range.</li>
+  <li><b>Extensions / Make / Model / Software</b> &ndash; Multi-select lists \
+populated from your loaded results. Check one or more items to show only \
+matching files. If nothing is checked, no restriction is applied for that \
+category.</li>
+</ul>
+<p>Click <b>Clear</b> in the Filter dialog or <b>Clear Search/Filters</b> \
+in the toolbar to reset all filters and show all results again.</p>
+
+<h3>Sorting</h3>
+<p>Click any column header in the results table to sort by that column. \
+Click again to reverse the sort order. Numeric columns (latitude, longitude, \
+altitude) and date columns sort correctly by value, not alphabetically.</p>
+
+<h3>Importing Additional Files</h3>
+<p>When you import new files or folders and results are already loaded, \
+you will be prompted to choose:</p>
+<ul>
+  <li><b>Replace</b> &ndash; Clear the existing results and load only the \
+new files.</li>
+  <li><b>Append</b> &ndash; Add the new files to the existing results. \
+Duplicate files (same path) are automatically skipped.</li>
+</ul>
+
 <h3>Viewing All Metadata</h3>
 <p>Right-click any row in the table and choose <b>View all EXIF / Metadata</b> \
 to open a detailed dialog showing every metadata tag in the file.</p>
@@ -638,7 +796,7 @@ processing. You can always re-scan with thumbnails enabled later.</li>
 <style>{a_style}</style>
 
 <h2 style="margin-bottom: 2px;{f' color: {hc};' if hc else ''}">EXIF Data Extractor</h2>
-<p style="color: {mc}; margin-top: 0;">Version 1.1</p>
+<p style="color: {mc}; margin-top: 0;">Version 2.0</p>
 
 <p>A desktop application for extracting, viewing, and exporting EXIF and \
 metadata from digital image and video files. Designed for investigative, \
@@ -790,7 +948,8 @@ libraries. For questions or issues, contact the developer, Patrick Koebbe \
                                    "None of the dropped files are supported media types.")
             return
 
-        self.folder_button.setEnabled(False)
+        if not self._begin_import_flow(media_files):
+            return
 
         reply = QMessageBox.question(
             self,
@@ -831,6 +990,9 @@ libraries. For questions or issues, contact the developer, Patrick Koebbe \
             self.status_bar.showMessage("No media files found")
             return
 
+        if not self._begin_import_flow(media_files):
+            return
+
         reply = QMessageBox.question(
             self,
             "Generate Thumbnails?",
@@ -863,16 +1025,18 @@ libraries. For questions or issues, contact the developer, Patrick Koebbe \
     
     def extraction_finished(self, exif_data_list):
         """Handle completion of metadata extraction."""
-        self.exif_data_list = exif_data_list
-        self.populate_table(exif_data_list)
+        merged = self._merge_import_results(exif_data_list)
+        self.exif_data_list = merged
+        self._set_results(merged)
         self.progress_bar.setVisible(False)
         self.folder_button.setEnabled(True)
         self.export_csv_button.setEnabled(True)
         self.export_json_button.setEnabled(True)
         self.export_pdf_button.setEnabled(True)
-        has_gps = any(exif_data.has_gps() for exif_data in exif_data_list)
+        has_gps = any(exif_data.has_gps() for exif_data in merged)
         self.export_kmz_button.setEnabled(has_gps)
         self.status_bar.showMessage(f"Extracted metadata from {len(exif_data_list)} file(s)")
+        self._update_result_count()
     
     def extraction_error(self, error_message):
         """Handle extraction errors."""
@@ -880,81 +1044,23 @@ libraries. For questions or issues, contact the developer, Patrick Koebbe \
         self.folder_button.setEnabled(True)
         self.progress_bar.setVisible(False)
     
-    def populate_table(self, exif_data_list):
-        """Populate the results table with EXIF data."""
-        self.table.setRowCount(len(exif_data_list))
-        
-        for row, exif_data in enumerate(exif_data_list):
-            # Thumbnail (column 0)
-            if exif_data.thumbnail:
-                # Convert PIL Image to QPixmap
-                try:
-                    # Convert PIL Image to bytes
-                    img_bytes = io.BytesIO()
-                    exif_data.thumbnail.save(img_bytes, format='PNG')
-                    img_bytes.seek(0)
-                    
-                    # Create QImage from bytes
-                    qimage = QImage.fromData(img_bytes.read())
-                    pixmap = QPixmap.fromImage(qimage)
-                    
-                    # Create item with pixmap
-                    thumbnail_item = QTableWidgetItem()
-                    thumbnail_item.setData(Qt.DecorationRole, pixmap)
-                    thumbnail_item.setTextAlignment(Qt.AlignCenter)
-                    self.table.setItem(row, 0, thumbnail_item)
-                except Exception:
-                    # If thumbnail display fails, show placeholder
-                    self.table.setItem(row, 0, QTableWidgetItem("No preview"))
-            else:
-                self.table.setItem(row, 0, QTableWidgetItem("No thumbnail"))
-            
-            # File Name (column 1)
-            self.table.setItem(row, 1, QTableWidgetItem(exif_data.file_name))
-            
-            # Timestamp (column 2) — EXIF encoded date (DateTimeOriginal, DateTimeDigitized, or DateTime)
-            date_str = exif_data.date_taken.strftime("%Y-%m-%d %H:%M:%S") if exif_data.date_taken else ""
-            date_item = QTableWidgetItem(date_str)
-            date_item.setToolTip("EXIF encoded date: DateTimeOriginal, DateTimeDigitized, or DateTime")
-            self.table.setItem(row, 2, date_item)
-            
-            # Latitude (column 3)
-            lat_str = f"{exif_data.latitude:.6f}" if exif_data.latitude is not None else ""
-            self.table.setItem(row, 3, QTableWidgetItem(lat_str))
-            
-            # Longitude (column 4)
-            lon_str = f"{exif_data.longitude:.6f}" if exif_data.longitude is not None else ""
-            self.table.setItem(row, 4, QTableWidgetItem(lon_str))
-            
-            # Altitude (column 5)
-            alt_str = f"{exif_data.altitude:.2f}" if exif_data.altitude is not None else ""
-            self.table.setItem(row, 5, QTableWidgetItem(alt_str))
-            
-            # Make (column 6)
-            self.table.setItem(row, 6, QTableWidgetItem(exif_data.make or ""))
-            
-            # Model (column 7)
-            self.table.setItem(row, 7, QTableWidgetItem(exif_data.model or ""))
-            
-            # Serial Number (column 8)
-            self.table.setItem(row, 8, QTableWidgetItem(exif_data.serial_number or ""))
-            
-            # Software (column 9)
-            self.table.setItem(row, 9, QTableWidgetItem(exif_data.software or ""))
-        
-        # Enable map button if any row has GPS data
-        has_gps = any(exif_data.has_gps() for exif_data in exif_data_list)
-        self.map_button.setEnabled(has_gps)
+    def _set_results(self, exif_data_list):
+        """Set results on the source model and refresh filter options."""
+        for exif_data in exif_data_list:
+            self._ensure_thumbnail_pixmap(exif_data)
+        self.source_model.set_rows(exif_data_list)
+        self._refresh_filter_options(exif_data_list)
+        self._apply_filters()
     
     def show_context_menu(self, position):
         """Show context menu for table rows."""
-        item = self.table.itemAt(position)
-        if item is None:
+        index = self.table.indexAt(position)
+        if not index.isValid():
             return
-        row = item.row()
-        if row < 0 or row >= len(self.exif_data_list):
+        source_index = self.proxy_model.mapToSource(index)
+        exif_data = self.source_model.get_row(source_index.row())
+        if exif_data is None:
             return
-        exif_data = self.exif_data_list[row]
         menu = QMenu(self)
         view_exif_action = QAction("View all EXIF / Metadata", self)
         view_exif_action.triggered.connect(
@@ -1009,8 +1115,10 @@ libraries. For questions or issues, contact the developer, Patrick Koebbe \
         
         if not selected_rows:
             # If no row selected, check if any row has GPS and use first one
-            for i, exif_data in enumerate(self.exif_data_list):
-                if exif_data.has_gps():
+            for r in range(self.proxy_model.rowCount()):
+                src = self.proxy_model.mapToSource(self.proxy_model.index(r, 0))
+                exif_data = self.source_model.get_row(src.row())
+                if exif_data and exif_data.has_gps():
                     open_location_in_map(exif_data.latitude, exif_data.longitude)
                     return
             QMessageBox.information(self, "No GPS Data", 
@@ -1019,19 +1127,19 @@ libraries. For questions or issues, contact the developer, Patrick Koebbe \
         
         # View first selected row with GPS data
         for row_index in selected_rows:
-            row = row_index.row()
-            if row < len(self.exif_data_list):
-                exif_data = self.exif_data_list[row]
-                if exif_data.has_gps():
-                    open_location_in_map(exif_data.latitude, exif_data.longitude)
-                    return
+            src = self.proxy_model.mapToSource(row_index)
+            exif_data = self.source_model.get_row(src.row())
+            if exif_data and exif_data.has_gps():
+                open_location_in_map(exif_data.latitude, exif_data.longitude)
+                return
         
         QMessageBox.information(self, "No GPS Data", 
                                "The selected file(s) do not have GPS coordinates.")
     
     def export_to_csv(self):
         """Export EXIF data to CSV file."""
-        if not self.exif_data_list:
+        export_rows = self._current_view_rows()
+        if not export_rows:
             return
         
         file_path, _ = QFileDialog.getSaveFileName(
@@ -1039,7 +1147,7 @@ libraries. For questions or issues, contact the developer, Patrick Koebbe \
         )
         
         if file_path:
-            if export_to_csv(self.exif_data_list, file_path):
+            if export_to_csv(export_rows, file_path):
                 QMessageBox.information(self, "Export Successful", 
                                        f"Data exported to {file_path}")
             else:
@@ -1048,7 +1156,8 @@ libraries. For questions or issues, contact the developer, Patrick Koebbe \
     
     def export_to_json(self):
         """Export EXIF data to JSON file."""
-        if not self.exif_data_list:
+        export_rows = self._current_view_rows()
+        if not export_rows:
             return
         
         file_path, _ = QFileDialog.getSaveFileName(
@@ -1056,7 +1165,7 @@ libraries. For questions or issues, contact the developer, Patrick Koebbe \
         )
         
         if file_path:
-            if export_to_json(self.exif_data_list, file_path):
+            if export_to_json(export_rows, file_path):
                 QMessageBox.information(self, "Export Successful", 
                                        f"Data exported to {file_path}")
             else:
@@ -1065,7 +1174,8 @@ libraries. For questions or issues, contact the developer, Patrick Koebbe \
     
     def export_to_pdf(self):
         """Export EXIF data to PDF file."""
-        if not self.exif_data_list:
+        export_rows = self._current_view_rows()
+        if not export_rows:
             return
 
         file_path, _ = QFileDialog.getSaveFileName(
@@ -1084,7 +1194,7 @@ libraries. For questions or issues, contact the developer, Patrick Koebbe \
         self.export_pdf_button.setEnabled(False)
         self.export_kmz_button.setEnabled(False)
 
-        self._pdf_worker = PDFExportWorker(self.exif_data_list, file_path)
+        self._pdf_worker = PDFExportWorker(export_rows, file_path)
         self._pdf_worker.finished.connect(self._on_pdf_export_finished)
         self._pdf_worker.start()
 
@@ -1109,9 +1219,10 @@ libraries. For questions or issues, contact the developer, Patrick Koebbe \
 
     def export_to_kmz_handler(self):
         """Export location data to a KMZ file for Google Earth."""
-        if not self.exif_data_list:
+        export_rows = self._current_view_rows()
+        if not export_rows:
             return
-        if not any(exif_data.has_gps() for exif_data in self.exif_data_list):
+        if not any(exif_data.has_gps() for exif_data in export_rows):
             QMessageBox.information(
                 self,
                 "No GPS Data",
@@ -1125,11 +1236,152 @@ libraries. For questions or issues, contact the developer, Patrick Koebbe \
             return
         if not file_path.lower().endswith('.kmz'):
             file_path = file_path + '.kmz'
-        if export_to_kmz(self.exif_data_list, file_path):
+        if export_to_kmz(export_rows, file_path):
             QMessageBox.information(self, "Export Successful", f"Location data exported to {file_path}")
             self.status_bar.showMessage("KMZ export completed.")
         else:
             QMessageBox.warning(self, "Export Failed", "Failed to export to KMZ.")
+
+    def _ensure_thumbnail_pixmap(self, exif_data: ExifData) -> None:
+        if getattr(exif_data, "thumbnail_qpixmap", None) is not None:
+            return
+        if not exif_data.thumbnail:
+            return
+        try:
+            img_bytes = io.BytesIO()
+            exif_data.thumbnail.save(img_bytes, format="PNG")
+            img_bytes.seek(0)
+            qimage = QImage.fromData(img_bytes.read())
+            pixmap = QPixmap.fromImage(qimage)
+            setattr(exif_data, "thumbnail_qpixmap", pixmap)
+        except Exception:
+            pass
+
+    def _current_view_rows(self):
+        rows = []
+        for r in range(self.proxy_model.rowCount()):
+            src = self.proxy_model.mapToSource(self.proxy_model.index(r, 0))
+            exif = self.source_model.get_row(src.row())
+            if exif is not None:
+                rows.append(exif)
+        return rows
+
+    def _update_result_count(self):
+        shown = self.proxy_model.rowCount()
+        total = self.source_model.rowCount()
+        self.result_count_label.setText(f"{shown} / {total} shown" if total else "")
+        self.map_button.setEnabled(any(r.has_gps() for r in self._current_view_rows()))
+        self.clear_search_filter_button.setEnabled(self._has_active_search_or_filters())
+
+    def _refresh_filter_options(self, rows):
+        self._filter_options = {
+            "extensions": sorted({(r.extension or "").lower() for r in rows if (r.extension or "").strip()}),
+            "makes": sorted({(r.make or "").strip() for r in rows if (r.make or "").strip()}),
+            "models": sorted({(r.model or "").strip() for r in rows if (r.model or "").strip()}),
+            "softwares": sorted({(r.software or "").strip() for r in rows if (r.software or "").strip()}),
+        }
+
+    def _apply_filters(self):
+        self.proxy_model.set_filters(self._filters)
+        self._update_result_count()
+
+    def _has_active_search_or_filters(self) -> bool:
+        f = self._filters
+        if (f.query or "").strip():
+            return True
+        if f.include_full_metadata is True or f.partial_match is False:
+            return True
+        if f.file_type != "All" or f.gps != "Any" or f.serial_presence != "Any":
+            return True
+        if f.date_from is not None or f.date_to is not None:
+            return True
+        if f.extensions or f.makes or f.models or f.softwares:
+            return True
+        return False
+
+    def open_search_dialog(self):
+        initial = SearchSettings(
+            query=self._filters.query,
+            partial_match=self._filters.partial_match,
+            include_full_metadata=self._filters.include_full_metadata,
+        )
+        dlg = SearchDialog(self, initial=initial)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        res = dlg.result()
+        if res is None:
+            return
+        self._filters.query = res.query
+        self._filters.partial_match = res.partial_match
+        self._filters.include_full_metadata = res.include_full_metadata
+        self._apply_filters()
+
+    def open_filter_dialog(self):
+        options = getattr(self, "_filter_options", {"extensions": [], "makes": [], "models": [], "softwares": []})
+        initial = FilterSettings(
+            file_type=self._filters.file_type,
+            gps=self._filters.gps,
+            serial_presence=self._filters.serial_presence,
+            date_from=self._filters.date_from,
+            date_to=self._filters.date_to,
+            extensions=set(self._filters.extensions),
+            makes=set(self._filters.makes),
+            models=set(self._filters.models),
+            softwares=set(self._filters.softwares),
+        )
+        dlg = FilterDialog(self, initial=initial, options=options)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        res = dlg.result()
+        if res is None:
+            return
+        self._filters.file_type = res.file_type
+        self._filters.gps = res.gps
+        self._filters.serial_presence = res.serial_presence
+        self._filters.date_from = res.date_from
+        self._filters.date_to = res.date_to
+        self._filters.extensions = set(res.extensions)
+        self._filters.makes = set(res.makes)
+        self._filters.models = set(res.models)
+        self._filters.softwares = set(res.softwares)
+        self._apply_filters()
+
+    def clear_search_and_filters(self):
+        self._filters = ExifProxyFilters()
+        self._apply_filters()
+
+    def _begin_import_flow(self, media_files) -> bool:
+        if not media_files:
+            return False
+
+        self._import_mode = "replace"
+        self.folder_button.setEnabled(False)
+
+        if self.source_model.rowCount() > 0:
+            choice = choose_import_mode(self, default_mode="replace")
+            if choice.mode == "cancel":
+                self.folder_button.setEnabled(True)
+                self.status_bar.showMessage("Cancelled")
+                return False
+            self._import_mode = choice.mode
+
+        return True
+
+    def _merge_import_results(self, new_rows):
+        mode = getattr(self, "_import_mode", "replace")
+        if mode == "append":
+            existing = self.source_model.rows()
+            seen = {os.path.normcase(os.path.abspath(r.file_path)) for r in existing if r.file_path}
+            to_add = []
+            for r in new_rows:
+                key = os.path.normcase(os.path.abspath(r.file_path)) if r.file_path else ""
+                if key and key in seen:
+                    continue
+                if key:
+                    seen.add(key)
+                to_add.append(r)
+            return existing + to_add
+        return list(new_rows)
 
 
 def main():
